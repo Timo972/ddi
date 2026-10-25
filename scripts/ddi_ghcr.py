@@ -13,7 +13,9 @@ import urllib.request
 
 
 RELEASES = "https://xcodereleases.com/data.json"
+RUNNER_IMAGES = "https://raw.githubusercontent.com/actions/runner-images/main/README.md"
 BUILD = re.compile(r"[0-9]{2}[A-Z][0-9]+[a-z]?")
+RUNNER_ROW = re.compile(r"^\| Xcode ([0-9]+)\b.*\|\s*arm64\s*\|\s*`xcode-([0-9]+)`")
 PAYLOADS = {
     "PersonalizedDMG",
     "LoadableTrustCache",
@@ -68,6 +70,19 @@ def discover(releases_bytes):
         **release,
         "candidates": builds,
     }
+
+
+def select_runner(candidates, readme):
+    newest_major = int(candidates[0]["xcode_build"][:2])
+    available = set()
+    for line in readme.splitlines():
+        if match := RUNNER_ROW.match(line):
+            if match.group(1) == match.group(2):
+                available.add(int(match.group(1)))
+    eligible = [major for major in available if major <= newest_major]
+    if not eligible:
+        raise ValueError("GitHub advertises no Xcode runner for the recent releases")
+    return f"xcode-{max(eligible)}"
 
 
 def select_xcode(candidates, app_root):
@@ -160,6 +175,7 @@ def main():
     args = parser.parse_args()
     if args.command == "discover":
         result = discover(fetch(RELEASES))
+        result["macos_runner"] = select_runner(result["candidates"], fetch(RUNNER_IMAGES).decode())
     elif args.command == "select-xcode":
         result = select_xcode(json.loads(pathlib.Path(args.candidate).read_text())["candidates"], args.app_root)
     else:

@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       new: ${{ steps.check.outputs.new }}
+      macos_runner: ${{ steps.poll.outputs.macos_runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -27,8 +28,11 @@ jobs:
       - name: Test DDI discovery and manifest validation
         run: python3 -B -m unittest discover -s scripts -p 'test_ddi_ghcr.py' -v
       - name: Poll Xcode releases
+        id: poll
         run: |
           python3 scripts/ddi_ghcr.py discover > candidate.json
+          runner=$(python3 -c 'import json; print(json.load(open("candidate.json"))["macos_runner"])')
+          echo "macos_runner=$runner" >> "$GITHUB_OUTPUT"
           cat candidate.json
       - name: Check whether this Xcode build was processed
         id: check
@@ -61,7 +65,7 @@ jobs:
   publish:
     needs: discover
     if: needs.discover.outputs.new == 'true'
-    runs-on: xcode-27
+    runs-on: ${{ needs.discover.outputs.macos_runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

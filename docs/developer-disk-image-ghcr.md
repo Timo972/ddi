@@ -33,8 +33,11 @@ The XIP URL redirects anonymous requests to Apple's unauthorized page. More
 importantly, the current Xcode.app bundle does not contain the DDI: Xcode
 installs it separately under `/Library/Developer/CoreDevice/CandidateDDIs`.
 For these reasons the workflow does not download or expand the XIP on Ubuntu.
-The macOS job uses GitHub's `xcode-27` runner. It selects the newest Xcode app
-whose build appears in that release list, then runs Apple's documented
+The Linux job reads GitHub's published runner-image list and chooses the newest
+`xcode-<major>` runner no newer than the latest Xcode release. When GitHub adds
+an `xcode-28` runner, the workflow can switch to it without an edit. The macOS
+job selects the newest installed Xcode app whose build appears in the release
+list, then runs Apple's documented
 `xcodebuild -runFirstLaunch -checkForNewerComponents` to fetch device support.
 If the runner has not caught up, the job records that fact and retries on the
 next schedule. This can delay or prevent publication of releases that never

@@ -43,6 +43,15 @@ class DiscoverTest(unittest.TestCase):
             self.assertEqual(selected["build"], "27B48")
             self.assertEqual(selected["path"], str(apps / "Xcode_27.2_RC.app"))
 
+    def test_selects_newest_advertised_runner_without_exceeding_release(self):
+        readme = "\n".join([
+            "| Xcode 27 | arm64 | `xcode-27` or `xcode-27-xlarge` | [xcode-27] |",
+            "| Xcode 28 | arm64 | `xcode-28` or `xcode-28-xlarge` | [xcode-28] |",
+        ])
+        self.assertEqual(ddi_ghcr.select_runner([{"xcode_build": "28A100"}], readme), "xcode-28")
+        self.assertEqual(ddi_ghcr.select_runner([{"xcode_build": "27B48"}], readme), "xcode-27")
+        self.assertEqual(ddi_ghcr.select_runner([{"xcode_build": "28A100"}], readme.splitlines()[0]), "xcode-27")
+
 
 class PackageTest(unittest.TestCase):
     def setUp(self):
