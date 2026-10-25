@@ -61,7 +61,7 @@ jobs:
   publish:
     needs: discover
     if: needs.discover.outputs.new == 'true'
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -78,14 +78,15 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          target=$(python3 -c 'import json; print(json.load(open("candidate.json"))["xcode_build"])')
-          installed=$(xcodebuild -version | sed -n 's/^Build version //p')
-          echo "Newest Xcode release: $target; runner Xcode build: $installed"
-          if ! python3 -c 'import json,sys; sys.exit(0 if sys.argv[1] in [x["xcode_build"] for x in json.load(open("candidate.json"))["candidates"]] else 1)' "$installed"; then
+          python3 scripts/ddi_ghcr.py select-xcode candidate.json /Applications > selected-xcode.json
+          if [ "$(python3 -c 'import json; print(str(json.load(open("selected-xcode.json"))["available"]).lower())')" != true ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Runner Xcode is not among the recent releases; the next scheduled poll will retry." >> "$GITHUB_STEP_SUMMARY"
+            echo "Runner has none of the recent Xcode releases; the next scheduled poll will retry." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          installed=$(python3 -c 'import json; print(json.load(open("selected-xcode.json"))["build"])')
+          app=$(python3 -c 'import json; print(json.load(open("selected-xcode.json"))["path"])')
+          echo "Selected Xcode $installed at $app"
           echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           if oras manifest fetch "$IMAGE:xcode-$installed" > /dev/null 2> manifest-error.txt; then
             echo "available=false" >> "$GITHUB_OUTPUT"
@@ -94,6 +95,12 @@ jobs:
           fi
           if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
             cat manifest-error.txt >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$app/Contents/Developer"
+          actual=$(xcodebuild -version | sed -n 's/^Build version //p')
+          if [ "$actual" != "$installed" ]; then
+            echo "Selected Xcode reports $actual instead of $installed" >&2
             exit 1
           fi
           sudo xcodebuild -runFirstLaunch -checkForNewerComponents

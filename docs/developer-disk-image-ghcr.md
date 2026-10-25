@@ -33,12 +33,12 @@ The XIP URL redirects anonymous requests to Apple's unauthorized page. More
 importantly, the current Xcode.app bundle does not contain the DDI: Xcode
 installs it separately under `/Library/Developer/CoreDevice/CandidateDDIs`.
 For these reasons the workflow does not download or expand the XIP on Ubuntu.
-On macOS it requires the hosted runner's installed Xcode build to match one of
-those recent releases, then runs Apple's documented
+The macOS job uses GitHub's `xcode-27` runner. It selects the newest Xcode app
+whose build appears in that release list, then runs Apple's documented
 `xcodebuild -runFirstLaunch -checkForNewerComponents` to fetch device support.
 If the runner has not caught up, the job records that fact and retries on the
-next schedule. This can delay or prevent publication of betas or release
-candidates that never appear on a hosted runner.
+next schedule. This can delay or prevent publication of releases that never
+appear on a hosted runner.
 
 The macOS job attaches `iOS_DDI.dmg` read-only with `hdiutil`. It refuses a
 DDI whose build differs from the selected Xcode build. Before publication it

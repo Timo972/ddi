@@ -30,6 +30,19 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(result["xcode_build"], "27B48")
         self.assertEqual(len(result["candidates"]), 2)
 
+    def test_selects_newest_installed_xcode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apps = pathlib.Path(tmp)
+            for name, build in [("Xcode_27.1.app", "27A9275"), ("Xcode_27.2_RC.app", "27B48")]:
+                contents = apps / name / "Contents"
+                contents.mkdir(parents=True)
+                (contents / "version.plist").write_bytes(plistlib.dumps({"ProductBuildVersion": build}))
+            selected = ddi_ghcr.select_xcode(
+                [{"xcode_build": "27B48"}, {"xcode_build": "27A9275"}], apps
+            )
+            self.assertEqual(selected["build"], "27B48")
+            self.assertEqual(selected["path"], str(apps / "Xcode_27.2_RC.app"))
+
 
 class PackageTest(unittest.TestCase):
     def setUp(self):

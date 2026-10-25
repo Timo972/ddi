@@ -70,6 +70,23 @@ def discover(releases_bytes):
     }
 
 
+def select_xcode(candidates, app_root):
+    installed = {}
+    for app in pathlib.Path(app_root).glob("Xcode*.app"):
+        version_file = app / "Contents/version.plist"
+        if not version_file.is_file():
+            continue
+        version = plistlib.loads(version_file.read_bytes())
+        build = version.get("ProductBuildVersion")
+        if isinstance(build, str) and BUILD.fullmatch(build):
+            installed[build] = app
+    for candidate in candidates:
+        build = candidate["xcode_build"]
+        if build in installed:
+            return {"available": True, "build": build, "path": str(installed[build])}
+    return {"available": False}
+
+
 def package(source, output):
     source = pathlib.Path(source)
     restore = source / "Restore"
@@ -134,11 +151,19 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("discover")
+    select = sub.add_parser("select-xcode")
+    select.add_argument("candidate")
+    select.add_argument("app_root")
     extract = sub.add_parser("package")
     extract.add_argument("source")
     extract.add_argument("archive")
     args = parser.parse_args()
-    result = discover(fetch(RELEASES)) if args.command == "discover" else package(args.source, args.archive)
+    if args.command == "discover":
+        result = discover(fetch(RELEASES))
+    elif args.command == "select-xcode":
+        result = select_xcode(json.loads(pathlib.Path(args.candidate).read_text())["candidates"], args.app_root)
+    else:
+        result = package(args.source, args.archive)
     print(json.dumps(result, sort_keys=True))
 
 
