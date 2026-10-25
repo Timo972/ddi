@@ -1,0 +1,158 @@
+name: Personalized Developer Disk Image
+
+on:
+  schedule:
+    - cron: "17 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: personalized-ddi-publish
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      new: ${{ steps.check.outputs.new }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: oras-project/setup-oras@v2
+      - name: Test DDI discovery and manifest validation
+        run: python3 -B -m unittest discover -s scripts -p 'test_ddi_ghcr.py' -v
+      - name: Poll Xcode releases
+        run: |
+          python3 scripts/ddi_ghcr.py discover > candidate.json
+          cat candidate.json
+      - name: Check whether this Xcode build was processed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          new=false
+          while IFS= read -r build; do
+            if oras manifest fetch "$IMAGE:xcode-$build" > /dev/null 2> manifest-error.txt; then
+              continue
+            fi
+            if grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
+              new=true
+            else
+              cat manifest-error.txt >&2
+              exit 1
+            fi
+          done < <(python3 -c 'import json; print("\n".join(x["xcode_build"] for x in json.load(open("candidate.json"))["candidates"]))')
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.new == 'true'
+        with:
+          name: ddi-candidate
+          path: candidate.json
+          retention-days: 1
+
+  publish:
+    needs: discover
+    if: needs.discover.outputs.new == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: oras-project/setup-oras@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: ddi-candidate
+      - name: Install current Xcode device components
+        id: xcode
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          target=$(python3 -c 'import json; print(json.load(open("candidate.json"))["xcode_build"])')
+          installed=$(xcodebuild -version | sed -n 's/^Build version //p')
+          echo "Newest Xcode release: $target; runner Xcode build: $installed"
+          if ! python3 -c 'import json,sys; sys.exit(0 if sys.argv[1] in [x["xcode_build"] for x in json.load(open("candidate.json"))["candidates"]] else 1)' "$installed"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Runner Xcode is not among the recent releases; the next scheduled poll will retry." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if oras manifest fetch "$IMAGE:xcode-$installed" > /dev/null 2> manifest-error.txt; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Runner DDI $installed was already published." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
+            cat manifest-error.txt >&2
+            exit 1
+          fi
+          sudo xcodebuild -runFirstLaunch -checkForNewerComponents
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "build=$installed" >> "$GITHUB_OUTPUT"
+      - name: Attach and verify the Apple DDI
+        if: steps.xcode.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          mkdir -p "$RUNNER_TEMP/ddi-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/ddi-mounted" /Library/Developer/CoreDevice/CandidateDDIs/iOS_DDI.dmg
+          trap 'hdiutil detach "$RUNNER_TEMP/ddi-mounted"' EXIT
+          python3 scripts/ddi_ghcr.py package "$RUNNER_TEMP/ddi-mounted" "$RUNNER_TEMP/DeveloperDiskImage.tar.gz" > ddi-package.json
+          build=$(python3 -c 'import json; print(json.load(open("ddi-package.json"))["ddi_build"])')
+          manifest_sha=$(python3 -c 'import json; print(json.load(open("ddi-package.json"))["manifest_sha256"])')
+          target="${{ steps.xcode.outputs.build }}"
+          if [ "$build" != "$target" ]; then
+            echo "Installed DDI $build does not match Xcode $target" >&2
+            exit 1
+          fi
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if oras manifest fetch "$IMAGE:$build" > existing.json 2> manifest-error.txt; then
+            existing_sha=$(python3 -c 'import json; print(json.load(open("existing.json")).get("annotations", {}).get("io.idevice.ddi.manifest.sha256", ""))')
+            if [ "$existing_sha" != "$manifest_sha" ]; then
+              echo "Existing $build tag has a different or unrecorded BuildManifest.plist hash" >&2
+              exit 1
+            fi
+          else
+            if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
+              cat manifest-error.txt >&2
+              exit 1
+            fi
+            cd "$RUNNER_TEMP"
+            oras push "$IMAGE:$build" --artifact-type application/vnd.idevice.personalized-ddi.v1 \
+              --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --annotation "org.opencontainers.image.version=$build" \
+              --annotation "io.idevice.ddi.manifest.sha256=$manifest_sha" \
+              "DeveloperDiskImage.tar.gz:application/vnd.idevice.personalized-ddi.v1+tar+gzip"
+            cd "$GITHUB_WORKSPACE"
+          fi
+          oras tag "$IMAGE:$build" "xcode-$target"
+          if oras manifest fetch "$IMAGE:latest" > latest.json 2> manifest-error.txt; then
+            current=$(python3 -c 'import json; print(json.load(open("latest.json")).get("annotations", {}).get("org.opencontainers.image.version", ""))')
+            if [ -z "$current" ]; then
+              echo "Existing latest lacks a DDI build annotation" >&2
+              exit 1
+            fi
+            advance=$(python3 -c 'import json,sys; builds=[x["xcode_build"] for x in json.load(open("candidate.json"))["candidates"]]; print("true" if builds.index(sys.argv[1]) < (builds.index(sys.argv[2]) if sys.argv[2] in builds else len(builds)) else "false")' "$target" "$current")
+          else
+            if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
+              cat manifest-error.txt >&2
+              exit 1
+            fi
+            advance=true
+          fi
+          if [ "$advance" = true ]; then
+            oras tag "$IMAGE:$build" latest
+          fi
+          echo "Published $IMAGE:$build; inspected Xcode $target" >> "$GITHUB_STEP_SUMMARY"
