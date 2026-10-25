@@ -36,7 +36,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           new=false
           while IFS= read -r build; do
@@ -77,7 +77,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           target=$(python3 -c 'import json; print(json.load(open("candidate.json"))["xcode_build"])')
           installed=$(xcodebuild -version | sed -n 's/^Build version //p')
           echo "Newest Xcode release: $target; runner Xcode build: $installed"
@@ -105,7 +105,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           mkdir -p "$RUNNER_TEMP/ddi-mounted"
           hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/ddi-mounted" /Library/Developer/CoreDevice/CandidateDDIs/iOS_DDI.dmg
           trap 'hdiutil detach "$RUNNER_TEMP/ddi-mounted"' EXIT
