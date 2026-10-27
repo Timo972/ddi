@@ -49,15 +49,16 @@ package versions once `latest` names a v2 artifact.
 
 ## Classic images
 
-Classic images no longer change, so
-`.github/workflows/classic-developer-disk-images.yml` runs on manual
-dispatch only. It lists `DeveloperDiskImages/<major.minor>/` of
-doronz88/DeveloperDiskImage at the commit given (default
-`6eae353ae694bda1c421d4a3eee5459ae59c99a1`, 40 versions, 11.4 to 16.7),
-downloads each file from that commit, checks it against the tree's git blob
-SHA-1, and pushes it. A version already published with the same blobs is
-skipped. The import trusts doronz88's copies; the device's signature check
-at mount is the end-to-end check.
+Classic images no longer change: Xcode 15 replaced them with the
+personalized image, and they ship only in Xcode 14.3.1 and older, which no
+hosted runner carries. They were therefore uploaded once, on 2026-10-27, and
+no workflow publishes them. The 40 versions (11.4 to 16.7) come from
+`DeveloperDiskImages/<major.minor>/` of doronz88/DeveloperDiskImage at
+commit `6eae353ae694bda1c421d4a3eee5459ae59c99a1`; each file was checked
+against that tree's git blob SHA-1 before the push, and the annotations
+record the source. The upload trusts doronz88's copies; the device's
+signature check at mount is the end-to-end check. The `prune` job never
+deletes them.
 
 ## Source and publication
 

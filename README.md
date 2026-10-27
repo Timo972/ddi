@@ -6,9 +6,10 @@ This public repository publishes Apple's iOS developer disk images (DDIs) to
 - **Personalized** (iOS 17 and later), from the DDI Xcode installs, checked
   against Apple's `BuildManifest.plist` digests. Tags: the DDI build
   (`27B48`), `xcode-<build>`, and `latest` for the newest.
-- **Classic** (iOS 11.4 to 16.7), imported once from
+- **Classic** (iOS 11.4 to 16.7), uploaded once from
   [doronz88/DeveloperDiskImage](https://github.com/doronz88/DeveloperDiskImage)
-  at a pinned commit. Tags: `classic-<major.minor>` (`classic-16.7`).
+  at a pinned commit; they no longer change. Tags: `classic-<major.minor>`
+  (`classic-16.7`).
 
 Pull the newest personalized image, in Apple's `Restore` layout:
 

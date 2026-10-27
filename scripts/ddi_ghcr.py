@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Discover an Xcode release, validate Apple's installed personalized iOS DDI,
-and describe it, or a classic DDI, as OCI layers for oras."""
+and describe it as OCI layers for oras."""
 
 import argparse
 import hashlib
@@ -24,15 +24,8 @@ MANIFEST_MEDIA = "application/vnd.idevice.personalized-ddi.buildmanifest.v2"
 FILE_MEDIA = "application/vnd.idevice.personalized-ddi.file.v2"
 MANIFEST_FILE = "Restore/BuildManifest.plist"
 RETIRED_TYPES = {"application/vnd.idevice.personalized-ddi.v1"}
-# OCI layout of a classic (pre-iOS 17) DDI, tagged classic-<major.minor>.
-CLASSIC_TYPE = "application/vnd.idevice.classic-ddi.v1"
-CLASSIC_FILES = {
-    "DeveloperDiskImage.dmg": "application/vnd.idevice.classic-ddi.image.v1",
-    "DeveloperDiskImage.dmg.signature": "application/vnd.idevice.classic-ddi.signature.v1",
-}
-CLASSIC_VERSION = re.compile(r"[0-9]+\.[0-9]+")
-GIT_BLOB_ANNOTATION = "io.idevice.ddi.source.git-blob"
-CLASSIC_SOURCE = "doronz88/DeveloperDiskImage"
+# The classic-<major.minor> tags (application/vnd.idevice.classic-ddi.v1) were
+# uploaded once and are never pruned: classic images no longer change.
 PAYLOADS = {
     "PersonalizedDMG",
     "LoadableTrustCache",
@@ -208,74 +201,6 @@ def prunable(versions):
     return [v["id"] for v in versions if v.get("artifactType") in RETIRED_TYPES]
 
 
-def git_blob_sha(data):
-    """Return the git blob SHA-1 of data, as GitHub's tree API lists it."""
-    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
-
-
-def classic_plan(tree):
-    """List the classic images in a GitHub tree of doronz88/DeveloperDiskImage.
-
-    tree is the JSON of GET /repos/{owner}/{repo}/git/trees/{commit}?recursive=1.
-    Every version must hold both the image and its signature.
-    """
-    if tree.get("truncated"):
-        raise ValueError("tree listing is truncated")
-    versions = {}
-    for entry in tree.get("tree", []):
-        if entry.get("type") != "blob":
-            continue
-        parts = entry["path"].split("/")
-        if len(parts) != 3 or parts[0] != "DeveloperDiskImages" or parts[2] not in CLASSIC_FILES:
-            continue
-        if not CLASSIC_VERSION.fullmatch(parts[1]):
-            raise ValueError(f"unexpected classic version directory: {parts[1]}")
-        versions.setdefault(parts[1], {})[parts[2]] = {"path": entry["path"], "sha": entry["sha"], "size": entry["size"]}
-    plan = []
-    for version in sorted(versions, key=lambda v: tuple(int(x) for x in v.split("."))):
-        files = versions[version]
-        if set(files) != set(CLASSIC_FILES):
-            raise ValueError(f"classic {version} lacks {sorted(set(CLASSIC_FILES) - set(files))}")
-        plan.append({
-            "version": version,
-            "files": [dict(name=name, media_type=CLASSIC_FILES[name], **files[name]) for name in CLASSIC_FILES],
-        })
-    if not plan:
-        raise ValueError("tree holds no classic images")
-    return plan
-
-
-def classic_push(entry, commit):
-    """Return the oras push layers and annotation file for one classic_plan entry.
-
-    The manifest records the source commit and every layer its git blob
-    SHA-1, which classic_state compares to skip an unchanged version.
-    """
-    source = f"https://github.com/{CLASSIC_SOURCE}/tree/{commit}/DeveloperDiskImages/{entry['version']}"
-    annotations = {"$manifest": {
-        "org.opencontainers.image.version": entry["version"],
-        "org.opencontainers.image.source": "https://github.com/Timo972/ddi",
-        "io.idevice.ddi.source": source,
-    }}
-    for f in entry["files"]:
-        annotations[f["name"]] = {GIT_BLOB_ANNOTATION: f["sha"]}
-    return {
-        "layers": [f"{f['name']}:{f['media_type']}" for f in entry["files"]],
-        "annotations": annotations,
-    }
-
-
-def classic_state(manifest, entry):
-    """Report "current" when a published classic artifact holds entry's files, else "stale"."""
-    if manifest.get("artifactType") != CLASSIC_TYPE:
-        return "stale"
-    published = {}
-    for layer in manifest.get("layers", []):
-        annotations = layer.get("annotations", {})
-        published[annotations.get("org.opencontainers.image.title")] = annotations.get(GIT_BLOB_ANNOTATION)
-    want = {f["name"]: f["sha"] for f in entry["files"]}
-    return "current" if published == want else "stale"
-
 
 def load_json(path):
     return json.loads(pathlib.Path(path).read_text())
@@ -294,14 +219,6 @@ def main():
     state.add_argument("manifest_sha256")
     sub.add_parser("is-current").add_argument("manifest")
     sub.add_parser("prunable").add_argument("versions")
-    sub.add_parser("classic-plan").add_argument("tree")
-    sub.add_parser("git-blob-sha").add_argument("file")
-    cpush = sub.add_parser("classic-push")
-    cpush.add_argument("entry")
-    cpush.add_argument("commit")
-    cstate = sub.add_parser("classic-state")
-    cstate.add_argument("manifest")
-    cstate.add_argument("entry")
     args = parser.parse_args()
     if args.command == "discover":
         result = discover(fetch(RELEASES))
@@ -316,14 +233,6 @@ def main():
         result = is_current(load_json(args.manifest))
     elif args.command == "prunable":
         result = prunable(load_json(args.versions))
-    elif args.command == "classic-plan":
-        result = classic_plan(load_json(args.tree))
-    elif args.command == "git-blob-sha":
-        result = git_blob_sha(pathlib.Path(args.file).read_bytes())
-    elif args.command == "classic-push":
-        result = classic_push(load_json(args.entry), args.commit)
-    else:
-        result = classic_state(load_json(args.manifest), load_json(args.entry))
     print(json.dumps(result, sort_keys=True))
 
 
