@@ -44,7 +44,12 @@ jobs:
           echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           new=false
           while IFS= read -r build; do
-            if oras manifest fetch "$IMAGE:xcode-$build" > /dev/null 2> manifest-error.txt; then
+            # A receipt of a retired layout does not count: that build is
+            # published again in the current one.
+            if oras manifest fetch "$IMAGE:xcode-$build" > receipt.json 2> manifest-error.txt; then
+              if [ "$(python3 scripts/ddi_ghcr.py is-current receipt.json)" != true ]; then
+                new=true
+              fi
               continue
             fi
             if grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
@@ -92,12 +97,14 @@ jobs:
           app=$(python3 -c 'import json; print(json.load(open("selected-xcode.json"))["path"])')
           echo "Selected Xcode $installed at $app"
           echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          if oras manifest fetch "$IMAGE:xcode-$installed" > /dev/null 2> manifest-error.txt; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Runner DDI $installed was already published." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
+          if oras manifest fetch "$IMAGE:xcode-$installed" > receipt.json 2> manifest-error.txt; then
+            if [ "$(python3 scripts/ddi_ghcr.py is-current receipt.json)" = true ]; then
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "Runner DDI $installed was already published." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Runner DDI $installed was published in a retired layout; publishing it again."
+          elif ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
             cat manifest-error.txt >&2
             exit 1
           fi
@@ -120,32 +127,36 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ddi-mounted"
           hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/ddi-mounted" /Library/Developer/CoreDevice/CandidateDDIs/iOS_DDI.dmg
           trap 'hdiutil detach "$RUNNER_TEMP/ddi-mounted"' EXIT
-          python3 scripts/ddi_ghcr.py package "$RUNNER_TEMP/ddi-mounted" "$RUNNER_TEMP/DeveloperDiskImage.tar.gz" > ddi-package.json
+          python3 scripts/ddi_ghcr.py package "$RUNNER_TEMP/ddi-mounted" > ddi-package.json
           build=$(python3 -c 'import json; print(json.load(open("ddi-package.json"))["ddi_build"])')
           manifest_sha=$(python3 -c 'import json; print(json.load(open("ddi-package.json"))["manifest_sha256"])')
+          layers=()
+          while IFS= read -r layer; do layers+=("$layer"); done < <(python3 -c 'import json; print("\n".join(json.load(open("ddi-package.json"))["layers"]))')
           target="${{ steps.xcode.outputs.build }}"
           if [ "$build" != "$target" ]; then
             echo "Installed DDI $build does not match Xcode $target" >&2
             exit 1
           fi
           echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          state=absent
           if oras manifest fetch "$IMAGE:$build" > existing.json 2> manifest-error.txt; then
-            existing_sha=$(python3 -c 'import json; print(json.load(open("existing.json")).get("annotations", {}).get("io.idevice.ddi.manifest.sha256", ""))')
-            if [ "$existing_sha" != "$manifest_sha" ]; then
-              echo "Existing $build tag has a different or unrecorded BuildManifest.plist hash" >&2
-              exit 1
-            fi
-          else
-            if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
-              cat manifest-error.txt >&2
-              exit 1
-            fi
-            cd "$RUNNER_TEMP"
-            oras push "$IMAGE:$build" --artifact-type application/vnd.idevice.personalized-ddi.v1 \
+            state=$(python3 scripts/ddi_ghcr.py published-state existing.json "$manifest_sha" | tr -d '"')
+          elif ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
+            cat manifest-error.txt >&2
+            exit 1
+          fi
+          if [ "$state" = mismatch ]; then
+            echo "Existing $build tag has a different BuildManifest.plist" >&2
+            exit 1
+          fi
+          if [ "$state" != current ]; then
+            # One layer per file, titled by its path in the mounted image,
+            # so `oras pull` recreates Apple's layout.
+            cd "$RUNNER_TEMP/ddi-mounted"
+            oras push "$IMAGE:$build" --artifact-type application/vnd.idevice.personalized-ddi.v2 \
               --annotation "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
               --annotation "org.opencontainers.image.version=$build" \
-              --annotation "io.idevice.ddi.manifest.sha256=$manifest_sha" \
-              "DeveloperDiskImage.tar.gz:application/vnd.idevice.personalized-ddi.v1+tar+gzip"
+              "${layers[@]}"
             cd "$GITHUB_WORKSPACE"
           fi
           oras tag "$IMAGE:$build" "xcode-$target"
@@ -155,7 +166,11 @@ jobs:
               echo "Existing latest lacks a DDI build annotation" >&2
               exit 1
             fi
-            advance=$(python3 -c 'import json,sys; builds=[x["xcode_build"] for x in json.load(open("candidate.json"))["candidates"]]; print("true" if builds.index(sys.argv[1]) < (builds.index(sys.argv[2]) if sys.argv[2] in builds else len(builds)) else "false")' "$target" "$current")
+            if [ "$(python3 scripts/ddi_ghcr.py is-current latest.json)" != true ]; then
+              advance=true # latest still names a retired layout
+            else
+              advance=$(python3 -c 'import json,sys; builds=[x["xcode_build"] for x in json.load(open("candidate.json"))["candidates"]]; print("true" if builds.index(sys.argv[1]) <= (builds.index(sys.argv[2]) if sys.argv[2] in builds else len(builds)) else "false")' "$target" "$current")
+            fi
           else
             if ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' manifest-error.txt; then
               cat manifest-error.txt >&2
@@ -167,3 +182,50 @@ jobs:
             oras tag "$IMAGE:$build" latest
           fi
           echo "Published $IMAGE:$build; inspected Xcode $target" >> "$GITHUB_STEP_SUMMARY"
+
+  prune:
+    # Deletes package versions in a retired layout once latest names the
+    # current one, so a failed or skipped publish never removes the only
+    # image. Only the types ddi_ghcr.RETIRED_TYPES lists are deleted.
+    needs: [discover, publish]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: oras-project/setup-oras@v2
+      - name: Delete retired package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          PACKAGE="${GITHUB_REPOSITORY#*/}"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras manifest fetch "$IMAGE:latest" > latest.json
+          if [ "$(python3 scripts/ddi_ghcr.py is-current latest.json)" != true ]; then
+            echo "latest still names a retired layout; nothing pruned." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh api --paginate "users/$OWNER/packages/container/$PACKAGE/versions" --jq '.[] | [.id, .name] | @tsv' > versions.tsv
+          echo "[" > versions.json
+          sep=""
+          while IFS=$'\t' read -r id digest; do
+            type=""
+            if oras manifest fetch "$IMAGE@$digest" > version.json 2> /dev/null; then
+              type=$(python3 -c 'import json; print(json.load(open("version.json")).get("artifactType", ""))')
+            fi
+            printf '%s{"id": %s, "artifactType": "%s"}\n' "$sep" "$id" "$type" >> versions.json
+            sep=","
+          done < versions.tsv
+          echo "]" >> versions.json
+          python3 scripts/ddi_ghcr.py prunable versions.json > prunable.json
+          python3 -c 'import json; print("\n".join(str(i) for i in json.load(open("prunable.json"))))' > prunable.txt
+          while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            gh api -X DELETE "users/$OWNER/packages/container/$PACKAGE/versions/$id"
+            echo "Deleted retired package version $id" >> "$GITHUB_STEP_SUMMARY"
+          done < prunable.txt

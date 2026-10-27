@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Discover an Xcode release and package Apple's installed personalized iOS DDI."""
+"""Discover an Xcode release, validate Apple's installed personalized iOS DDI,
+and describe it, or a classic DDI, as OCI layers for oras."""
 
 import argparse
 import hashlib
@@ -7,7 +8,6 @@ import json
 import pathlib
 import plistlib
 import re
-import tarfile
 import urllib.parse
 import urllib.request
 
@@ -16,6 +16,23 @@ RELEASES = "https://xcodereleases.com/data.json"
 RUNNER_IMAGES = "https://raw.githubusercontent.com/actions/runner-images/main/README.md"
 BUILD = re.compile(r"[0-9]{2}[A-Z][0-9]+[a-z]?")
 RUNNER_ROW = re.compile(r"^\| Xcode ([0-9]+)\b.*\|\s*arm64\s*\|\s*`xcode-([0-9]+)`")
+# OCI layout of a personalized DDI: one layer per file, titled by its path
+# relative to the mounted image, so `oras pull` recreates Apple's layout and
+# a client fetches only the files it needs. Version 1 was one tar.gz layer.
+PERSONALIZED_TYPE = "application/vnd.idevice.personalized-ddi.v2"
+MANIFEST_MEDIA = "application/vnd.idevice.personalized-ddi.buildmanifest.v2"
+FILE_MEDIA = "application/vnd.idevice.personalized-ddi.file.v2"
+MANIFEST_FILE = "Restore/BuildManifest.plist"
+RETIRED_TYPES = {"application/vnd.idevice.personalized-ddi.v1"}
+# OCI layout of a classic (pre-iOS 17) DDI, tagged classic-<major.minor>.
+CLASSIC_TYPE = "application/vnd.idevice.classic-ddi.v1"
+CLASSIC_FILES = {
+    "DeveloperDiskImage.dmg": "application/vnd.idevice.classic-ddi.image.v1",
+    "DeveloperDiskImage.dmg.signature": "application/vnd.idevice.classic-ddi.signature.v1",
+}
+CLASSIC_VERSION = re.compile(r"[0-9]+\.[0-9]+")
+GIT_BLOB_ANNOTATION = "io.idevice.ddi.source.git-blob"
+CLASSIC_SOURCE = "doronz88/DeveloperDiskImage"
 PAYLOADS = {
     "PersonalizedDMG",
     "LoadableTrustCache",
@@ -102,7 +119,8 @@ def select_xcode(candidates, app_root):
     return {"available": False}
 
 
-def package(source, output):
+def package(source):
+    """Validate the DDI mounted at source and list its files as OCI layers."""
     source = pathlib.Path(source)
     restore = source / "Restore"
     version = plistlib.loads((source / "version.plist").read_bytes())
@@ -149,17 +167,118 @@ def package(source, output):
             actual = sha1.digest() if len(expected) == 20 else sha384.digest()
             if actual != expected:
                 raise ValueError(f"digest mismatch: {relative}")
-    output = pathlib.Path(output)
-    with tarfile.open(output, "w:gz") as archive:
-        for relative in sorted(files):
-            path = source / relative
-            archive.add(path, arcname=relative, recursive=False)
+    for name in files:
+        # oras push splits "path:mediatype" at the last colon.
+        if ":" in name:
+            raise ValueError(f"file name holds a colon: {name}")
     return {
         "ddi_build": build,
         "files": sorted(files),
+        "layers": [f"{name}:{MANIFEST_MEDIA if name == MANIFEST_FILE else FILE_MEDIA}" for name in sorted(files)],
         "manifest_sha256": hashlib.sha256((restore / "BuildManifest.plist").read_bytes()).hexdigest(),
-        "archive_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
     }
+
+
+def published_state(manifest, manifest_sha256):
+    """Compare a published OCI manifest with a local BuildManifest.plist.
+
+    "current": a v2 artifact whose BuildManifest layer has the same digest.
+    "stale": any other layout, to be published again.
+    "mismatch": a v2 artifact of the same build with other manifest bytes.
+    """
+    if manifest.get("artifactType") != PERSONALIZED_TYPE:
+        return "stale"
+    for layer in manifest.get("layers", []):
+        if layer.get("mediaType") == MANIFEST_MEDIA:
+            return "current" if layer.get("digest") == "sha256:" + manifest_sha256 else "mismatch"
+    return "mismatch"
+
+
+def is_current(manifest):
+    """Report whether a published OCI manifest uses the current personalized layout."""
+    return manifest.get("artifactType") == PERSONALIZED_TYPE
+
+
+def prunable(versions):
+    """Return the ids of package versions in a retired layout.
+
+    versions holds {"id": ..., "artifactType": ...} entries. Only retired
+    types are deleted, so an unknown or unreadable version stays.
+    """
+    return [v["id"] for v in versions if v.get("artifactType") in RETIRED_TYPES]
+
+
+def git_blob_sha(data):
+    """Return the git blob SHA-1 of data, as GitHub's tree API lists it."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def classic_plan(tree):
+    """List the classic images in a GitHub tree of doronz88/DeveloperDiskImage.
+
+    tree is the JSON of GET /repos/{owner}/{repo}/git/trees/{commit}?recursive=1.
+    Every version must hold both the image and its signature.
+    """
+    if tree.get("truncated"):
+        raise ValueError("tree listing is truncated")
+    versions = {}
+    for entry in tree.get("tree", []):
+        if entry.get("type") != "blob":
+            continue
+        parts = entry["path"].split("/")
+        if len(parts) != 3 or parts[0] != "DeveloperDiskImages" or parts[2] not in CLASSIC_FILES:
+            continue
+        if not CLASSIC_VERSION.fullmatch(parts[1]):
+            raise ValueError(f"unexpected classic version directory: {parts[1]}")
+        versions.setdefault(parts[1], {})[parts[2]] = {"path": entry["path"], "sha": entry["sha"], "size": entry["size"]}
+    plan = []
+    for version in sorted(versions, key=lambda v: tuple(int(x) for x in v.split("."))):
+        files = versions[version]
+        if set(files) != set(CLASSIC_FILES):
+            raise ValueError(f"classic {version} lacks {sorted(set(CLASSIC_FILES) - set(files))}")
+        plan.append({
+            "version": version,
+            "files": [dict(name=name, media_type=CLASSIC_FILES[name], **files[name]) for name in CLASSIC_FILES],
+        })
+    if not plan:
+        raise ValueError("tree holds no classic images")
+    return plan
+
+
+def classic_push(entry, commit):
+    """Return the oras push layers and annotation file for one classic_plan entry.
+
+    The manifest records the source commit and every layer its git blob
+    SHA-1, which classic_state compares to skip an unchanged version.
+    """
+    source = f"https://github.com/{CLASSIC_SOURCE}/tree/{commit}/DeveloperDiskImages/{entry['version']}"
+    annotations = {"$manifest": {
+        "org.opencontainers.image.version": entry["version"],
+        "org.opencontainers.image.source": "https://github.com/Timo972/ddi",
+        "io.idevice.ddi.source": source,
+    }}
+    for f in entry["files"]:
+        annotations[f["name"]] = {GIT_BLOB_ANNOTATION: f["sha"]}
+    return {
+        "layers": [f"{f['name']}:{f['media_type']}" for f in entry["files"]],
+        "annotations": annotations,
+    }
+
+
+def classic_state(manifest, entry):
+    """Report "current" when a published classic artifact holds entry's files, else "stale"."""
+    if manifest.get("artifactType") != CLASSIC_TYPE:
+        return "stale"
+    published = {}
+    for layer in manifest.get("layers", []):
+        annotations = layer.get("annotations", {})
+        published[annotations.get("org.opencontainers.image.title")] = annotations.get(GIT_BLOB_ANNOTATION)
+    want = {f["name"]: f["sha"] for f in entry["files"]}
+    return "current" if published == want else "stale"
+
+
+def load_json(path):
+    return json.loads(pathlib.Path(path).read_text())
 
 
 def main():
@@ -169,17 +288,42 @@ def main():
     select = sub.add_parser("select-xcode")
     select.add_argument("candidate")
     select.add_argument("app_root")
-    extract = sub.add_parser("package")
-    extract.add_argument("source")
-    extract.add_argument("archive")
+    sub.add_parser("package").add_argument("source")
+    state = sub.add_parser("published-state")
+    state.add_argument("manifest")
+    state.add_argument("manifest_sha256")
+    sub.add_parser("is-current").add_argument("manifest")
+    sub.add_parser("prunable").add_argument("versions")
+    sub.add_parser("classic-plan").add_argument("tree")
+    sub.add_parser("git-blob-sha").add_argument("file")
+    cpush = sub.add_parser("classic-push")
+    cpush.add_argument("entry")
+    cpush.add_argument("commit")
+    cstate = sub.add_parser("classic-state")
+    cstate.add_argument("manifest")
+    cstate.add_argument("entry")
     args = parser.parse_args()
     if args.command == "discover":
         result = discover(fetch(RELEASES))
         result["macos_runner"] = select_runner(result["candidates"], fetch(RUNNER_IMAGES).decode())
     elif args.command == "select-xcode":
-        result = select_xcode(json.loads(pathlib.Path(args.candidate).read_text())["candidates"], args.app_root)
+        result = select_xcode(load_json(args.candidate)["candidates"], args.app_root)
+    elif args.command == "package":
+        result = package(args.source)
+    elif args.command == "published-state":
+        result = published_state(load_json(args.manifest), args.manifest_sha256)
+    elif args.command == "is-current":
+        result = is_current(load_json(args.manifest))
+    elif args.command == "prunable":
+        result = prunable(load_json(args.versions))
+    elif args.command == "classic-plan":
+        result = classic_plan(load_json(args.tree))
+    elif args.command == "git-blob-sha":
+        result = git_blob_sha(pathlib.Path(args.file).read_bytes())
+    elif args.command == "classic-push":
+        result = classic_push(load_json(args.entry), args.commit)
     else:
-        result = package(args.source, args.archive)
+        result = classic_state(load_json(args.manifest), load_json(args.entry))
     print(json.dumps(result, sort_keys=True))
 
 

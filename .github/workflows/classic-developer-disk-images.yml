@@ -1,0 +1,90 @@
+name: Classic Developer Disk Images
+
+# Classic (pre-iOS 17) developer disk images no longer change: Xcode 15
+# replaced them with the personalized image. This workflow imports them once
+# from doronz88/DeveloperDiskImage at a pinned commit, checks every file
+# against that commit's git blob SHA-1, and publishes each "major.minor" as
+# ghcr.io/<repo>:classic-<major.minor>. A version already published with the
+# same blobs is skipped.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "doronz88/DeveloperDiskImage commit to import (full SHA)"
+        required: true
+        default: 6eae353ae694bda1c421d4a3eee5459ae59c99a1
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: classic-ddi-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: oras-project/setup-oras@v2
+      - name: Test classic planning
+        run: python3 -B -m unittest discover -s scripts -p 'test_ddi_ghcr.py' -v
+      - name: Import classic images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit must be a full lowercase SHA-1" >&2
+            exit 1
+          fi
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          S="$GITHUB_WORKSPACE/scripts/ddi_ghcr.py"
+          W="$RUNNER_TEMP/classic"
+          mkdir -p "$W"
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          gh api "repos/doronz88/DeveloperDiskImage/git/trees/$COMMIT?recursive=1" > "$W/tree.json"
+          python3 "$S" classic-plan "$W/tree.json" > "$W/plan.json"
+          count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$W/plan.json")
+          published=0
+          for i in $(seq 0 $((count - 1))); do
+            python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))[int(sys.argv[2])], open(sys.argv[3], "w"))' "$W/plan.json" "$i" "$W/entry.json"
+            version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$W/entry.json")
+            tag="classic-$version"
+            if oras manifest fetch "$IMAGE:$tag" > "$W/existing.json" 2> "$W/manifest-error.txt"; then
+              if [ "$(python3 "$S" classic-state "$W/existing.json" "$W/entry.json")" = '"current"' ]; then
+                echo "$tag is current"
+                continue
+              fi
+            elif ! grep -Eiq 'not found|404|NAME_UNKNOWN|MANIFEST_UNKNOWN' "$W/manifest-error.txt"; then
+              cat "$W/manifest-error.txt" >&2
+              exit 1
+            fi
+            dir="$W/$version"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            while IFS=$'\t' read -r name path sha; do
+              curl -fsSL --retry 3 -o "$dir/$name" "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/$COMMIT/$path"
+              actual=$(python3 "$S" git-blob-sha "$dir/$name" | tr -d '"')
+              if [ "$actual" != "$sha" ]; then
+                echo "$path: git blob $actual, tree says $sha" >&2
+                exit 1
+              fi
+            done < <(python3 -c 'import json,sys; [print(f["name"], f["path"], f["sha"], sep="\t") for f in json.load(open(sys.argv[1]))["files"]]' "$W/entry.json")
+            python3 "$S" classic-push "$W/entry.json" "$COMMIT" > "$W/push.json"
+            python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["annotations"], open(sys.argv[2], "w"))' "$W/push.json" "$W/annotations.json"
+            layers=()
+            while IFS= read -r layer; do layers+=("$layer"); done < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["layers"]))' "$W/push.json")
+            (cd "$dir" && oras push "$IMAGE:$tag" --artifact-type application/vnd.idevice.classic-ddi.v1 \
+              --annotation-file "$W/annotations.json" "${layers[@]}")
+            rm -rf "$dir"
+            published=$((published + 1))
+            echo "Published $IMAGE:$tag" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "Published $published of $count classic versions from doronz88/DeveloperDiskImage@$COMMIT" >> "$GITHUB_STEP_SUMMARY"
